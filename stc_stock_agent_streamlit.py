@@ -1,6 +1,7 @@
 import warnings
 warnings.filterwarnings("ignore")
 
+import time
 from dataclasses import dataclass, asdict
 from typing import Dict, List, Optional, Tuple
 
@@ -27,7 +28,7 @@ DEFAULT_CONFIG = {
     "target_return": 0.01,
     "max_stop_pct": 0.006,
     "daily_period": "2y",
-    "hourly_period": "730d",
+    "hourly_period": "180d",   # reduced from 730d
     "m15_period": "60d",
     "daily_interval": "1d",
     "hourly_interval": "60m",
@@ -86,6 +87,93 @@ def fmt_pct(x, nd=2):
     return f"{x*100:,.{nd}f}%"
 
 
+def normalize_saudi_ticker(ticker: str) -> str:
+    t = ticker.strip().upper()
+    if t.startswith("^"):
+        return t
+    if t.endswith(".SR"):
+        return t
+    if t.isdigit():
+        return f"{t}.SR"
+    return t
+
+
+# =========================================
+# RATE-LIMIT SAFE FETCHERS
+# =========================================
+@st.cache_data(ttl=1800, show_spinner=False)
+def cached_download(ticker: str, period: str, interval: str) -> pd.DataFrame:
+    last_error = None
+    for attempt in range(3):
+        try:
+            df = yf.download(
+                ticker,
+                period=period,
+                interval=interval,
+                auto_adjust=False,
+                progress=False,
+                threads=False,
+            )
+            df = flatten_columns(df)
+            df.dropna(inplace=True)
+            ensure_ohlcv(df)
+            df = normalize_datetime_index(df)
+            if df.empty:
+                raise ValueError(f"No data returned for {ticker} [{interval}, {period}]")
+            return df
+        except Exception as e:
+            last_error = e
+            time.sleep(2 + attempt * 2)
+
+    raise RuntimeError(f"Failed to download {ticker} after retries. Last error: {last_error}")
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def cached_info_snapshot(ticker: str) -> Dict:
+    """
+    Prefer fast_info. Fall back to info. If both fail, return minimal structure.
+    """
+    try:
+        tk = yf.Ticker(ticker)
+
+        out = {"symbol": ticker}
+
+        # fast_info is lighter than full info
+        try:
+            fi = tk.fast_info
+            if fi:
+                out.update({
+                    "currentPrice": fi.get("lastPrice"),
+                    "fiftyTwoWeekLow": fi.get("yearLow"),
+                    "fiftyTwoWeekHigh": fi.get("yearHigh"),
+                    "marketCap": fi.get("marketCap"),
+                })
+        except Exception:
+            pass
+
+        try:
+            info = tk.info if isinstance(tk.info, dict) else {}
+            out.update({
+                "shortName": info.get("shortName"),
+                "sector": info.get("sector"),
+                "industry": info.get("industry"),
+                "trailingPE": info.get("trailingPE"),
+                "priceToBook": info.get("priceToBook"),
+                "dividendYield": info.get("dividendYield"),
+                "returnOnEquity": info.get("returnOnEquity"),
+                "returnOnAssets": info.get("returnOnAssets"),
+                "ebitdaMargins": info.get("ebitdaMargins"),
+                "profitMargins": info.get("profitMargins"),
+                "averageVolume": info.get("averageVolume"),
+            })
+        except Exception:
+            pass
+
+        return out
+    except Exception:
+        return {"symbol": ticker}
+
+
 # =========================================
 # DATA LOADER
 # =========================================
@@ -93,21 +181,9 @@ class MarketDataLoader:
     def __init__(self, stock_ticker: str, market_ticker: str):
         self.stock_ticker = stock_ticker
         self.market_ticker = market_ticker
-        self.stock_obj = yf.Ticker(stock_ticker)
 
     def download_prices(self, ticker: str, interval: str, period: str) -> pd.DataFrame:
-        df = yf.download(
-            ticker,
-            period=period,
-            interval=interval,
-            auto_adjust=False,
-            progress=False
-        )
-        df = flatten_columns(df)
-        df.dropna(inplace=True)
-        ensure_ohlcv(df)
-        df = normalize_datetime_index(df)
-        return df
+        return cached_download(ticker, period, interval)
 
     def load_all(self, cfg: Dict) -> Dict[str, pd.DataFrame]:
         return {
@@ -120,25 +196,7 @@ class MarketDataLoader:
         }
 
     def get_info_snapshot(self) -> Dict:
-        info = self.stock_obj.info if isinstance(self.stock_obj.info, dict) else {}
-        return {
-            "symbol": self.stock_ticker,
-            "shortName": info.get("shortName"),
-            "sector": info.get("sector"),
-            "industry": info.get("industry"),
-            "marketCap": info.get("marketCap"),
-            "currentPrice": info.get("currentPrice"),
-            "trailingPE": info.get("trailingPE"),
-            "priceToBook": info.get("priceToBook"),
-            "dividendYield": info.get("dividendYield"),
-            "returnOnEquity": info.get("returnOnEquity"),
-            "returnOnAssets": info.get("returnOnAssets"),
-            "ebitdaMargins": info.get("ebitdaMargins"),
-            "profitMargins": info.get("profitMargins"),
-            "fiftyTwoWeekLow": info.get("fiftyTwoWeekLow"),
-            "fiftyTwoWeekHigh": info.get("fiftyTwoWeekHigh"),
-            "averageVolume": info.get("averageVolume"),
-        }
+        return cached_info_snapshot(self.stock_ticker)
 
 
 # =========================================
@@ -826,15 +884,15 @@ def build_dashboard(stock_daily: pd.DataFrame, stock_hourly: pd.DataFrame, stock
 # =========================================
 st.set_page_config(page_title="Saudi Stock Decision Assistant", layout="wide")
 st.title("Saudi Stock Decision Assistant")
-st.caption("أدخل رمز السهم السعودي بصيغة Yahoo مثل 7010.SR أو 7203.SR")
+st.caption("أدخل رمز السهم السعودي بصيغة Yahoo مثل 7010 أو 7010.SR أو 7203.SR")
 
 with st.sidebar:
     st.header("الإعدادات")
 
-    stock_ticker = st.text_input(
+    stock_input = st.text_input(
         "رمز السهم",
-        value="7010.SR",
-        help="أدخل رمز Yahoo Finance للسهم. مثال: 7010.SR لـ STC، 7203.SR لـ علم. تغيير هذه القيمة يغيّر السهم الذي سيُحلّل بالكامل."
+        value="7010",
+        help="يمكنك إدخال 7010 أو 7010.SR. إذا أدخلت رقمًا فقط فسيتم إضافة .SR تلقائيًا."
     )
 
     market_ticker = st.text_input(
@@ -881,7 +939,7 @@ with st.sidebar:
     with st.expander("شرح المكونات وتأثير تغيير القيم", expanded=False):
         st.markdown("""
 **رمز السهم**  
-يحدد السهم الذي سيُحلّل. تغييره يغيّر كل النتائج والرسوم والاختبار التاريخي.
+يحدد السهم الذي سيُحلّل. إذا أدخلت رقمًا فقط مثل 7010 فسيتم تحويله إلى 7010.SR تلقائيًا.
 
 **رمز السوق المرجعي**  
 يستخدم لمقارنة أداء السهم مقابل السوق. تغييره يؤثر على قراءة القوة النسبية.
@@ -909,6 +967,9 @@ cfg["max_stop_pct"] = max_stop_pct
 
 if run_btn:
     try:
+        stock_ticker = normalize_saudi_ticker(stock_input)
+        market_ticker = normalize_saudi_ticker(market_ticker)
+
         with st.spinner("جاري التحليل..."):
             results = run_analysis(stock_ticker.strip(), market_ticker.strip(), cfg)
 
@@ -975,6 +1036,10 @@ if run_btn:
             st.json(decision.fundamentals)
 
     except Exception as e:
-        st.error(f"حدث خطأ أثناء التحليل: {e}")
+        st.error(
+            "حدث خطأ أثناء التحليل. إذا ظهر خطأ متعلق بـ Too Many Requests "
+            "فهذا يعني أن Yahoo Finance حدّ من الطلبات مؤقتًا. انتظر قليلًا ثم أعد المحاولة.\n\n"
+            f"التفاصيل: {e}"
+        )
 else:
     st.info("أدخل رمز السهم ثم اضغط: تحليل السهم")
