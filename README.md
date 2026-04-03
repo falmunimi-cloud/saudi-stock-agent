@@ -1,11 +1,12 @@
 # Saudi Stock Decision Assistant
 
 A Streamlit app for analyzing Saudi stocks using:
+
 - multi-timeframe technical analysis
 - support/resistance logic
 - breakout/pullback detection
 - trade plan generation
-- backtesting summary
+- simple backtesting summary
 
 ## Run locally
 

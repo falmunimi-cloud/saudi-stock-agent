@@ -4,4 +4,3 @@ ta
 plotly
 pandas
 numpy
-tabulate
